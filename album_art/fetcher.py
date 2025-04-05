@@ -11,25 +11,28 @@ import mutagen.id3
 import mutagen.flac
 import mutagen.mp4
 from typing import Optional, Set, Dict, Any
-from album_art.config import Config
 from album_art.exceptions import AlbumArtFetchError, ImageProcessingError
 from mpd import MPDClient
 
 class Fetcher:
     """Fetches album art from music files or directories."""
     
-    def __init__(self):
-        """Initialize the fetcher with logging."""
+    def __init__(self, config):
+        """Initialize the fetcher with logging and configuration."""
+        self.config = config
         self.logger = logging.getLogger(f"{__name__}.Fetcher")
         self.logger.info("Initializing album art fetcher")
         
         try:
+            # Get placeholder location from config
+            placeholder_loc = self.config['file_paths']['placeholder_loc']
+            
             # Ensure the placeholder image exists
-            if not os.path.exists(Config.PLACEHOLDER_LOC):
-                self.logger.warning(f"Placeholder image not found at {Config.PLACEHOLDER_LOC}, creating new one")
+            if not os.path.exists(placeholder_loc):
+                self.logger.warning(f"Placeholder image not found at {placeholder_loc}, creating new one")
                 self._create_placeholder_image()
             else:
-                self.logger.debug(f"Using existing placeholder image at {Config.PLACEHOLDER_LOC}")
+                self.logger.debug(f"Using existing placeholder image at {placeholder_loc}")
         except Exception as e:
             self.logger.critical("Failed to initialize fetcher due to placeholder image issue", exc_info=True)
             raise ImageProcessingError("Failed to initialize fetcher") from e
@@ -37,14 +40,19 @@ class Fetcher:
     def _create_placeholder_image(self):
         """Create a simple placeholder image if one doesn't exist."""
         try:
-            self.logger.debug(f"Creating placeholder image at {Config.PLACEHOLDER_LOC}")
-            img = Image.new('RGB', Config.PLACEHOLDER_IMAGE_SIZE, color=Config.PLACEHOLDER_IMAGE_COLOR)
-            img.save(Config.PLACEHOLDER_LOC, "PNG")
-            self.logger.info(f"Successfully created placeholder image at {Config.PLACEHOLDER_LOC}")
+            placeholder_loc = self.config['file_paths']['placeholder_loc']
+            image_size = self.config['display']['placeholder_image_size']
+            image_color = self.config['display']['placeholder_image_color']
+            
+            self.logger.debug(f"Creating placeholder image at {placeholder_loc}")
+            img = Image.new('RGB', tuple(image_size), color=tuple(image_color))
+            img.save(placeholder_loc, "PNG")
+            self.logger.info(f"Successfully created placeholder image at {placeholder_loc}")
         except Exception as e:
-            self.logger.error(f"Failed to create placeholder image at {Config.PLACEHOLDER_LOC}", exc_info=True)
+            placeholder_loc = self.config['file_paths']['placeholder_loc']
+            self.logger.error(f"Failed to create placeholder image at {placeholder_loc}", exc_info=True)
             raise ImageProcessingError(f"Failed to create placeholder image: {str(e)}") from e
-
+    
     def mutagen_fetcher(self, song_path: str) -> Optional[bytes]:
         """Extracts embedded album art using Mutagen library."""
         if not os.path.exists(song_path):
@@ -118,32 +126,44 @@ class Fetcher:
             return None
         self.logger.debug(f"No 'covr' data found in MP4 file {os.path.basename(song_path)}")
         return None
-
+    
     def get_album_art(self, song_file: str, mpd_client: MPDClient) -> None:
         """
-        Attempts to retrieve album art using multiple methods and save it.
-        
-        Args:
-            song_file: Path to the audio file relative to music library
-            mpd_client: Connected MPD client instance
+    Attempts to retrieve album art using multiple methods and save it.
+    
+    This method implements a fallback chain of strategies to find album art:
+    1. First tries MPD's readpicture command (if available)
+    2. Then attempts to extract embedded art using Mutagen
+    3. Finally looks for common cover art filenames in the song's directory
+    
+    For each source, the art is resized to a standard size and saved to the
+    configured location. If no art is found, a placeholder image is used.
+    
+    Args:
+        song_file: Path to the audio file relative to music library
+        mpd_client: Connected MPD client instance
             
-        Raises:
-            AlbumArtFetchError: If a critical error occurs during fetching
-        """
+    Raises:
+        AlbumArtFetchError: If a critical error occurs during fetching
+    """
         self.logger.info(f"Starting album art fetch for: {song_file}")
         
-        full_song_path = os.path.join(Config.MUSIC_LIBRARY, song_file)
+        music_library = self.config['file_paths']['music_library']
+        full_song_path = os.path.join(music_library, song_file)
         self.logger.debug(f"Full song path: {full_song_path}")
 
         # Set default placeholder image first
         try:
-            if not os.path.exists(Config.PLACEHOLDER_LOC):
+            placeholder_loc = self.config['file_paths']['placeholder_loc']
+            album_art_loc = self.config['file_paths']['album_art_loc']
+            
+            if not os.path.exists(placeholder_loc):
                 self.logger.warning("Placeholder image missing, creating new one")
                 self._create_placeholder_image()
                 
-            default_img = Image.open(Config.PLACEHOLDER_LOC)
+            default_img = Image.open(placeholder_loc)
             default_img.thumbnail((500, 500))
-            default_img.save(Config.ALBUM_ART_LOC, "PNG")
+            default_img.save(album_art_loc, "PNG")
             self.logger.debug("Default placeholder image set successfully")
         except Exception as e:
             self.logger.error("Failed to set default album art", exc_info=True)
@@ -153,6 +173,7 @@ class Fetcher:
             self.logger.warning(f"Song file does not exist: {full_song_path}")
             return
         
+        # Define fetch methods with friendly names for logging
         fetch_methods = [
             ("MPD readpicture", self._fetch_mpd_readpicture),
             ("Mutagen metadata", self._fetch_mutagen_metadata),
@@ -175,18 +196,28 @@ class Fetcher:
         """
         Fetch album art using MPD's readpicture command.
         
+        This method uses the MPD protocol's readpicture command to request the embedded 
+        album art directly from the MPD server. This is often the most efficient method
+        when it's available, as it avoids having to access the file directly.
+        
+        Args:
+            song_file: Path to song file relative to music library
+            mpd_client: Connected MPD client instance
+            full_song_path: Absolute path to the song file
+            
         Returns:
             bool: True if successful, False otherwise
         """
         self.logger.debug("Attempting MPD readpicture method")
         try:
             art_data = mpd_client.readpicture(song_file)
+            album_art_loc = self.config['file_paths']['album_art_loc']
             
             if isinstance(art_data, dict) and 'binary' in art_data:
                 img_bytes = art_data['binary']
                 img = Image.open(io.BytesIO(img_bytes))
                 img.thumbnail((500, 500))
-                img.save(Config.ALBUM_ART_LOC, "PNG")
+                img.save(album_art_loc, "PNG")
                 self.logger.debug("Successfully processed album art from MPD readpicture")
                 return True
             
@@ -206,10 +237,12 @@ class Fetcher:
         self.logger.debug("Attempting Mutagen metadata extraction method")
         try:
             art_data = self.mutagen_fetcher(full_song_path)
+            album_art_loc = self.config['file_paths']['album_art_loc']
+            
             if art_data:
                 img = Image.open(io.BytesIO(art_data))
                 img.thumbnail((500, 500))
-                img.save(Config.ALBUM_ART_LOC, "PNG")
+                img.save(album_art_loc, "PNG")
                 self.logger.debug("Successfully processed album art from Mutagen metadata")
                 return True
             
@@ -229,27 +262,24 @@ class Fetcher:
         self.logger.debug("Attempting file-based cover art method")
         try:
             song_dir = os.path.dirname(full_song_path)
+            album_art_loc = self.config['file_paths']['album_art_loc']
+            
             if not os.path.isdir(song_dir):
                 self.logger.warning(f"Song directory does not exist: {song_dir}")
                 return False
                 
-            # Common cover art filenames
-            cover_filenames = [
-                'cover.jpg', 'cover.png', 'folder.jpg', 'folder.png',
-                'album.jpg', 'album.png', 'artwork.jpg', 'artwork.png',
-                'front.jpg', 'front.png', 'Cover.jpg', 'Cover.png',
-                'Folder.jpg', 'Folder.png', 'Album.jpg', 'Album.png'
-            ]
+            # Use cover formats from config
+            cover_formats = self.config['cover_formats']
             
             self.logger.debug(f"Searching for cover art files in: {song_dir}")
-            for filename in cover_filenames:
+            for filename in cover_formats:
                 cover_path = os.path.join(song_dir, filename)
                 if os.path.exists(cover_path):
                     self.logger.debug(f"Found cover art file: {cover_path}")
                     try:
                         img = Image.open(cover_path)
                         img.thumbnail((500, 500))
-                        img.save(Config.ALBUM_ART_LOC, "PNG")
+                        img.save(album_art_loc, "PNG")
                         self.logger.debug(f"Successfully processed cover art from file: {filename}")
                         return True
                     except Exception as e:

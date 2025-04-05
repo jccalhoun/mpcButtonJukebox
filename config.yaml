@@ -1,0 +1,38 @@
+# Album Art Viewer Configuration
+
+# File and path settings
+file_paths:
+  album_art_loc: ~/Downloads/.aartminip.png
+  placeholder_loc: ~/Downloads/.placeholder.png
+  music_library: ~/Music
+  song_list_path: ~/Music/song_list.txt
+  log_file: ~/album_art.log
+
+# Album art detection settings
+cover_formats:
+  - cover.jpg
+  - folder.jpg
+  - folder.png
+  - folder.jpeg
+  - cover.jpeg
+  - cover.png
+
+# MPD connection settings
+mpd:
+  host: localhost
+  port: 6600
+  password: false
+
+# Logging configuration
+logging:
+  level: INFO
+  format: '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+  max_bytes: 5242880  # 5MB in bytes (5 * 1024 * 1024)
+  backup_count: 3     # Keep 3 backup files
+
+# Album art display configuration options
+display:
+  placeholder_image_size: [500, 500]
+  placeholder_image_color: [0, 0, 0]
+  song_info_display_duration: 10
+  queue_notification_duration: 5

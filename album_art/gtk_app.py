@@ -8,9 +8,10 @@ import gi
 import threading
 import os
 import logging
+import signal
 from typing import Dict, List, Tuple, Optional, Any, Union, Callable, TypeVar, cast
 from gi.repository import Gtk, GLib, Gdk, Pango
-from album_art.config import Config
+
 from album_art.mpd_client import Tracker
 from album_art.fetcher import Fetcher
 from album_art.exceptions import AlbumArtError
@@ -24,14 +25,18 @@ SongInfo = Dict[str, str]  # MPD song information dictionary
 class AlbumArtApp(Gtk.Application):
     """Main GTK application for displaying album art and handling user input."""
     
-    def __init__(self, tracker: Tracker) -> None:
+    def __init__(self, tracker: Tracker, config) -> None:
         super().__init__()
+        self.config = config
+        self.fetcher: Fetcher = Fetcher(self.config)
+        self.running = threading.Event()  # ← Replace boolean with Event
+        self.running.set()  # Set to "True" initially
         self.logger: logging.Logger = logging.getLogger(__name__)
         self.tracker: Tracker = tracker
         self.image: Optional[Gtk.Picture] = None
         self.tracker_thread: Optional[threading.Thread] = None
-        self.fetcher: Fetcher = Fetcher()
         
+                
         # Set the global app_instance
         global app_instance
         app_instance = self
@@ -43,7 +48,16 @@ class AlbumArtApp(Gtk.Application):
         self.css_provider: Optional[Gtk.CssProvider] = None
         self.queue_notification_label: Optional[Gtk.Label] = None
         
+        # Set up signal handlers for graceful shutdown
+        signal.signal(signal.SIGINT, self._signal_handler)
+        signal.signal(signal.SIGTERM, self._signal_handler)
+        
         self.logger.info("AlbumArtApp initialized")
+    
+    def _signal_handler(self, sig, frame) -> None:
+        """Handle system signals for graceful shutdown."""
+        self.logger.info(f"Received signal {sig}, initiating shutdown")
+        self.quit()
     
     def get_dominant_edge_colors(self, image_path: str) -> Tuple[RGB, RGB]:
         """Extract dominant colors from left and right edges of the album art using NumPy."""
@@ -222,7 +236,18 @@ class AlbumArtApp(Gtk.Application):
             raise AlbumArtError(f"Application initialization failed: {str(e)}")
     
     def on_key_press(self, controller: Gtk.EventControllerKey, keyval: int, keycode: int, state: Gdk.ModifierType) -> bool:
-        """Handle key press events."""
+        """
+        Handle key press events from the GTK window.
+        
+        Args:
+            controller: The key controller that captured the event
+            keyval: The key value representing the pressed key
+            keycode: The hardware keycode of the pressed key
+            state: Modifier state (Shift, Ctrl, etc.) when key was pressed
+            
+        Returns:
+            True if the event was handled and should not propagate, False otherwise
+        """
         try:
             # Handle Escape key to exit fullscreen or close the app
             if keyval == Gdk.KEY_Escape:
@@ -236,7 +261,7 @@ class AlbumArtApp(Gtk.Application):
                     self.quit()
                     return True  # Event handled
             
-            # Process numeric input
+            # Process numeric input (numbers 0-9)
             keychar: Optional[str] = chr(keyval) if 48 <= keyval <= 57 else None  # 48-57 are ASCII for 0-9
             if keychar:  # If the key pressed is a digit
                 self.logger.debug(f"Numeric key pressed: {keychar}")
@@ -251,19 +276,21 @@ class AlbumArtApp(Gtk.Application):
     def update_album_art(self) -> bool:
         """Updates the displayed album art and background colors."""
         try:
-            if not os.path.exists(Config.ALBUM_ART_LOC):
-                self.logger.warning(f"Album art file not found: {Config.ALBUM_ART_LOC}")
+            album_art_loc = self.config['file_paths']['album_art_loc']
+            
+            if not os.path.exists(album_art_loc):
+                self.logger.warning(f"Album art file not found: {album_art_loc}")
                 self.set_fallback_image()
                 return False
                 
             # Update the album art display
-            texture: Gdk.Texture = Gdk.Texture.new_from_filename(Config.ALBUM_ART_LOC)
+            texture: Gdk.Texture = Gdk.Texture.new_from_filename(album_art_loc)
             self.image.set_paintable(texture)
             
             # Extract dominant colors from the album art edges and update background
-            left_color, right_color = self.get_dominant_edge_colors(Config.ALBUM_ART_LOC)
+            left_color, right_color = self.get_dominant_edge_colors(album_art_loc)
             self.update_background_gradient(left_color, right_color)
-            self.logger.info(f"Updated album art from {Config.ALBUM_ART_LOC}")
+            self.logger.info(f"Updated album art from {album_art_loc}")
         except Exception as e:
             self.logger.error(f"Error updating album art: {str(e)}", exc_info=True)
             self.set_fallback_image()
@@ -273,13 +300,15 @@ class AlbumArtApp(Gtk.Application):
     def set_fallback_image(self) -> None:
         """Displays a placeholder image and sets a default background."""
         try:
-            if not os.path.exists(Config.PLACEHOLDER_LOC):
-                self.logger.error(f"Placeholder image not found: {Config.PLACEHOLDER_LOC}")
+            placeholder_loc = self.config['file_paths']['placeholder_loc']
+
+            if not os.path.exists(placeholder_loc):
+                self.logger.error(f"Placeholder image not found: {placeholder_loc}")
                 # Create an emergency fallback with a black background
                 self.update_background_gradient([0, 0, 0], [0, 0, 0])
                 return
                 
-            texture: Gdk.Texture = Gdk.Texture.new_from_filename(Config.PLACEHOLDER_LOC)
+            texture: Gdk.Texture = Gdk.Texture.new_from_filename(placeholder_loc)
             self.image.set_paintable(texture)
             # Use default black background for placeholder
             self.update_background_gradient([0, 0, 0], [0, 0, 0])
@@ -293,12 +322,25 @@ class AlbumArtApp(Gtk.Application):
                 self.logger.critical(f"Critical error setting fallback image: {str(e2)}", exc_info=True)
     
     def update_song_info(self, artist: str, title: str) -> bool:
-        """Updates the artist and title labels."""
+        """
+        Updates the artist and title labels in the UI.
+        
+        This method safely updates the song information display with proper
+        escaping of special characters for Pango markup. It also schedules
+        the information to disappear after the configured duration.
+        
+        Args:
+            artist: Artist name to display
+            title: Song title to display
+            
+        Returns:
+            False to indicate the function should not be called again by GLib
+        """
         try:
             if not self.artist_label or not self.title_label:
                 self.logger.warning("Cannot update song info: Labels not initialized")
                 return False
-                
+            song_info_display_duration = self.config['display']['song_info_display_duration']    
             # Escape any Pango markup characters in the text
             safe_artist: str = artist.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
             safe_title: str = title.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -313,12 +355,12 @@ class AlbumArtApp(Gtk.Application):
             self.logger.info(f"Updated song info: {artist} - {title}")
 
             # Schedule the text to disappear after the configured duration
-            GLib.timeout_add_seconds(Config.SONG_INFO_DISPLAY_DURATION, self.clear_song_info)
+            GLib.timeout_add_seconds(song_info_display_duration, self.clear_song_info)
         except Exception as e:
             self.logger.error(f"Error updating song info: {str(e)}", exc_info=True)
 
-        return False  # Don't call again
-    
+        return False  # Don't call again - this function is meant to be called once per song change
+  
     def clear_song_info(self) -> bool:
         """Clears the artist and title labels."""
         try:
@@ -355,9 +397,9 @@ class AlbumArtApp(Gtk.Application):
             )
             
             self.logger.info(f"Queue notification displayed: {song_info}")
-            
+            queue_notification_duration = self.config['display']['queue_notification_duration']
             # Schedule the notification to disappear after the configured duration
-            GLib.timeout_add_seconds(Config.QUEUE_NOTIFICATION_DURATION, self.clear_queue_notification)
+            GLib.timeout_add_seconds(queue_notification_duration, self.clear_queue_notification)
         except Exception as e:
             self.logger.error(f"Error showing queue notification: {str(e)}", exc_info=True)
         
@@ -378,9 +420,36 @@ class AlbumArtApp(Gtk.Application):
             
         return False  # Don't call again
     
+    def show_special_command_notification(self, message: str) -> bool:
+        """Displays a notification about a special command execution."""
+        try:
+            if not self.queue_notification_label:
+                self.logger.warning("Cannot show notification: Label not initialized")
+                return False
+                
+            # Escape any Pango markup characters in the text
+            safe_text: str = message.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            
+            # Add the CSS class for background
+            self.queue_notification_label.get_style_context().add_class("has-text")
+        
+            self.queue_notification_label.set_markup(
+                f'<span foreground="#FFA500" font="18" weight="bold">Command: {safe_text}</span>'
+            )
+            
+            self.logger.info(f"Special command notification displayed: {message}")
+            queue_notification_duration = self.config['display']['queue_notification_duration']
+            # Schedule the notification to disappear after the configured duration
+            
+            GLib.timeout_add_seconds(queue_notification_duration, self.clear_queue_notification)
+        except Exception as e:
+            self.logger.error(f"Error showing special command notification: {str(e)}", exc_info=True)
+        
+        return False  # Don't call again
 
     def mpd_loop(self) -> None:
         """Continuously checks MPD for song updates and updates UI."""
+        
         last_song_path: Optional[str] = None
         connection_retry_delay: int = 2  # seconds
         connection_attempts: int = 0
@@ -388,7 +457,7 @@ class AlbumArtApp(Gtk.Application):
 
         self.logger.info("Starting MPD monitoring loop")
         
-        while True:
+        while self.running.is_set():  # ← Check Event flag
             try:
                 # Check MPD connection and reconnect if needed
                 connection_attempts = self._ensure_mpd_connection(connection_attempts, max_connection_attempts, connection_retry_delay)
@@ -408,10 +477,24 @@ class AlbumArtApp(Gtk.Application):
                     
             except Exception as e:
                 self.logger.error(f"Error in mpd_loop: {str(e)}", exc_info=True)
-                time.sleep(5)  # Add delay to avoid tight loop in case of recurring errors
+                if self.running.is_set():  # ← Only sleep if not shutting down
+                    time.sleep(5)  # Add delay to avoid tight loop in case of recurring errors
 
     def _ensure_mpd_connection(self, connection_attempts: int, max_connection_attempts: int, connection_retry_delay: int) -> int:
-        """Ensure MPD connection is active, reconnect if needed."""
+        """
+        Ensure MPD connection is active, reconnect if needed.
+        
+        This method tries to ping the MPD server and reconnect if the connection is lost.
+        It implements an exponential backoff strategy for retries.
+        
+        Args:
+            connection_attempts: Current number of connection attempts
+            max_connection_attempts: Maximum number of connection attempts before backing off
+            connection_retry_delay: Delay in seconds between connection attempts
+            
+        Returns:
+            Updated connection attempts counter (reset to 0 on success)
+        """
         try:
             self.tracker.client.ping()
             # Reset connection attempts counter on successful ping
@@ -449,11 +532,18 @@ class AlbumArtApp(Gtk.Application):
         return last_song_path
         
     def _wait_for_mpd_events(self) -> None:
-        """Wait for MPD events with robust reconnection mechanism."""
+        """
+        Wait for MPD events with robust reconnection mechanism.
+        
+        This method uses MPD's idle command to efficiently wait for changes,
+        with automatic retry and reconnection logic for network interruptions.
+        It avoids busy-waiting and implements progressive backoff for failures.
+        """
         retry_count: int = 3
         
         while retry_count > 0:
             try:
+                # The 'idle' command blocks until something changes in MPD
                 changes: List[str] = self.tracker.client.idle("player")
                 if changes:  # Only log if actual changes occurred
                     self.logger.debug(f"MPD changes detected: {changes}")
@@ -486,3 +576,26 @@ class AlbumArtApp(Gtk.Application):
         if retry_count == 0:
             self.logger.warning("All MPD idle retries failed, adding delay to avoid CPU spike")
             time.sleep(2)
+
+    def do_shutdown(self) -> None:
+        """Handle application shutdown and cleanup resources."""
+        try:
+            self.logger.info("Application shutting down, performing cleanup")
+            self.running.clear()  # ← Signal thread to exit (clear the Event)
+            
+            # Wait for thread to finish (with timeout to avoid hanging)
+            if self.tracker_thread and self.tracker_thread.is_alive():
+                self.tracker_thread.join(timeout=2.0)  # Wait up to 2 seconds
+                if self.tracker_thread.is_alive():
+                    self.logger.warning("MPD thread did not exit gracefully")
+        
+            
+            # Clean up tracker resources
+            if self.tracker:
+                self.tracker.cleanup()
+                
+            # Call parent shutdown
+            super().do_shutdown()
+            self.logger.info("Application shutdown completed")
+        except Exception as e:
+            self.logger.error(f"Error during application shutdown: {str(e)}", exc_info=True)

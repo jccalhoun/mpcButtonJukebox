@@ -1,28 +1,24 @@
 '''
 File: album_art/exceptions.py
-Description: Custom exception classes for the Album Art Viewer application
+Description: Custom exceptions for the Album Art Viewer application
 '''
 
 class AlbumArtError(Exception):
-    """Base exception class for Album Art Viewer application."""
-    pass
-
-class ConfigError(AlbumArtError):
-    """Exception raised for configuration errors."""
-    pass
-
-class MPDConnectionError(AlbumArtError):
-    """Exception raised for MPD connection issues."""
+    """Base exception class for all Album Art Viewer application errors."""
     pass
 
 class AlbumArtFetchError(AlbumArtError):
-    """Exception raised when album art cannot be fetched."""
-    pass
-
-class DisplayError(AlbumArtError):
-    """Exception raised for hardware display issues."""
+    """Exception raised when album art fetching fails."""
     pass
 
 class ImageProcessingError(AlbumArtError):
-    """Exception raised for image processing errors."""
+    """Exception raised when image processing operations fail."""
+    pass
+
+class MPDConnectionError(AlbumArtError):
+    """Exception raised when MPD connection operations fail."""
+    pass
+
+class ConfigurationError(AlbumArtError):
+    """Exception raised when configuration loading or validation fails."""
     pass

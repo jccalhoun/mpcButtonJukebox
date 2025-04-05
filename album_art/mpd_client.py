@@ -9,7 +9,6 @@ import time
 import os
 import logging
 from typing import Optional, Dict, Any, List
-from album_art.config import Config
 import board
 import busio
 import adafruit_ht16k33.segments
@@ -20,11 +19,12 @@ from gi.repository import GLib
 class Tracker:
     """Tracks the currently playing song and queue length from MPD with comprehensive logging."""
     
-    def __init__(self) -> None:
+    def __init__(self, config) -> None:
         """Initialize MPD tracker with connection and display setup."""
         self.logger = logging.getLogger(f"{__name__}.Tracker")
         self.logger.info("Initializing MPD tracker")
         
+        self.config = config
         self.client: MPDClient = MPDClient()
         self.client.timeout = 10
         self.lock: threading.Lock = threading.Lock()
@@ -35,7 +35,7 @@ class Tracker:
         # Initialize MPD connection
         if not self.connect():
             self.logger.error("Initial MPD connection failed")
-            raise MPDConnectionError("Could not establish initial MPD connection")
+            raise ConnectionError("Could not establish initial MPD connection")
         
         # Initialize hardware displays
         self._init_displays()
@@ -54,7 +54,7 @@ class Tracker:
             self.logger.info("Displays initialized successfully")
         except Exception as e:
             self.logger.critical("Failed to initialize displays", exc_info=True)
-            raise DisplayError("Display initialization failed") from e
+            raise Exception("Display initialization failed") from e
 
     def execute_mpd_command(self, command: str, *args) -> Any:
         """Execute an MPD command with automatic reconnection handling.
@@ -107,12 +107,16 @@ class Tracker:
 
     def connect(self) -> bool:
         """Establish connection to MPD server with detailed logging."""
-        self.logger.info(f"Connecting to MPD at {Config.MPDHOST}:{Config.MPDPORT}")
+        host = self.config['mpd']['host']
+        port = self.config['mpd']['port']
+        password = self.config['mpd']['password']
+        
+        self.logger.info(f"Connecting to MPD at {host}:{port}")
         try:
-            self.client.connect(Config.MPDHOST, Config.MPDPORT)
-            if Config.MPDPASS:
+            self.client.connect(host, port)
+            if password and password != 'false':
                 self.logger.debug("Authenticating with MPD password")
-                self.client.password(Config.MPDPASS)
+                self.client.password(password)
             
             # Verify connection
             status = self.client.status()
@@ -127,6 +131,10 @@ class Tracker:
 
     def reconnect_mpd(self, max_attempts: int = 3) -> bool:
         """Reconnect to MPD with retry logic and detailed logging."""
+        host = self.config['mpd']['host']
+        port = self.config['mpd']['port']
+        password = self.config['mpd']['password']
+        
         self.logger.warning(f"Attempting MPD reconnection (max attempts: {max_attempts})")
         
         # Clean up existing connection
@@ -144,9 +152,9 @@ class Tracker:
         for attempt in range(1, max_attempts + 1):
             try:
                 self.logger.debug(f"Reconnection attempt {attempt}/{max_attempts}")
-                self.client.connect(Config.MPDHOST, Config.MPDPORT)
-                if Config.MPDPASS:
-                    self.client.password(Config.MPDPASS)
+                self.client.connect(host, port)
+                if password and password != 'false':
+                    self.client.password(password)
                 
                 # Verify reconnection
                 self.client.ping()
@@ -210,7 +218,7 @@ class Tracker:
         """Handle new song detection with proper error handling."""
         try:
             from album_art.fetcher import Fetcher
-            fetcher = Fetcher()
+            fetcher = Fetcher(self.config)
             fetcher.get_album_art(song_file, self.client)
             self.logger.info(f"Album art updated for: {song_file}")
         except Exception as e:
@@ -270,15 +278,19 @@ class Tracker:
                 if line_number == 9999:
                     self.logger.info("Special input detected: Skipping to next song")
                     threading.Thread(target=self.skip_song, daemon=True).start()
+                    self._notify_special_command("Skipping to next song")
                 elif line_number == 8888:
                     self.logger.info("Special input detected: Stopping playback")
                     threading.Thread(target=self.stop_mpd, daemon=True).start()
+                    self._notify_special_command("Playback stopped")
                 elif line_number == 7777:
                     self.logger.info("Special input detected: Starting playback")
                     threading.Thread(target=self.start_mpd, daemon=True).start()
+                    self._notify_special_command("Playback started")
                 elif line_number == 6666:
                     self.logger.info("Special input detected: Clearing queue")
                     threading.Thread(target=self.clear_queue, daemon=True).start()
+                    self._notify_special_command("Queue cleared")
                 else:
                     threading.Thread(
                         target=self.add_song_to_mpd, 
@@ -292,14 +304,17 @@ class Tracker:
         """Add song to MPD queue with comprehensive logging."""
         self.logger.info(f"Attempting to add song from line {line_number}")
         
+        # Get song list path from config
+        song_list_path = self.config['file_paths']['song_list_path']
+        
         # Validate song list file
-        if not os.path.exists(Config.SONG_LIST_PATH):
-            self.logger.error(f"Song list file not found: {Config.SONG_LIST_PATH}")
+        if not os.path.exists(song_list_path):
+            self.logger.error(f"Song list file not found: {song_list_path}")
             return
 
         try:
             # Read song list
-            with open(Config.SONG_LIST_PATH, 'r') as file:
+            with open(song_list_path, 'r') as file:
                 lines = file.readlines()
                 self.logger.debug(f"Read {len(lines)} lines from song list")
 
@@ -385,7 +400,31 @@ class Tracker:
                 self.logger.debug(f"Sent notification for added song: {song_path}")
         except Exception as e:
             self.logger.warning("Failed to send song added notification", exc_info=True)
+    
+    def _notify_special_command(self, message: str):
+        """Notify UI about special command execution."""
+        try:
+            from album_art.gtk_app import app_instance
+            if app_instance:
+                GLib.idle_add(app_instance.show_special_command_notification, message)
+                self.logger.debug(f"Sent notification for special command: {message}")
+        except Exception as e:
+            self.logger.warning("Failed to send special command notification", exc_info=True)
 
+    def cleanup(self) -> None:
+        """Clean up resources and clear displays before exit."""
+        self.logger.info("Performing tracker cleanup")
+        try:
+            # Clear the displays
+            self.display_queue.fill(0)
+            self.display_input.fill(0)
+            self.logger.info("Cleared 7-segment displays")
+            
+            # Disconnect from MPD
+            self.disconnect()
+        except Exception as e:
+            self.logger.error(f"Error during tracker cleanup: {str(e)}", exc_info=True)
+    
     def disconnect(self) -> None:
         """Cleanly disconnect from MPD with logging."""
         self.logger.info("Disconnecting from MPD")

@@ -11,4 +11,6 @@ once a 4 digit number has been input the script looks up that line number from a
 
 album art based on https://github.com/dedenholm/mpd-Coverview-kitty 
 
+Here's a much more detailed readme that I had Claude.ai write: [github-readme-updated.md](https://github.com/jccalhoun/mpcButtonJukebox/blob/de5ac636528ff4db4161f21567d2fbafa9302290/github-readme-updated.md)
+
 

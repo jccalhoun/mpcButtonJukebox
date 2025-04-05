@@ -1,3 +1,5 @@
+Claude.ai wrote this readme. I read through it and didn't notice any errors of hallucinations. 
+
 # Raspberry Pi Jukebox
 
 A specialized application for transforming a traditional jukebox into a modern digital music player using a Raspberry Pi 5. This application displays album art and song information from an MPD (Music Player Daemon) music collection while maintaining the classic jukebox experience through numeric input.
